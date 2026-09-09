@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Raw match data supplied by the club - not redistributed.
+data/*
+!data/.gitkeep
