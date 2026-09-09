@@ -1,8 +1,8 @@
 """
 xG difference by game state - Polonia Bytom vs Pogon Grodzisk Mazowiecki (match_id 4068759).
 
-For each team and each game state (winning / drawing / losing): xG For, xG Against
-and their difference, from StatsBomb event data.
+For each team and each game state (winning / drawing / losing): xG For, xG Against and
+their difference, from StatsBomb event data.
 
 Key assumption (PRE-SHOT): the game state of a shot is the scoreline BEFORE that shot.
 A goal changes the state only for events that follow it, so a shot that makes it 1-0
@@ -19,8 +19,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 INPUT_PATH = PROJECT_ROOT / "data" / "match_4068759.csv"
 OUTPUT_PATH = PROJECT_ROOT / "results" / "xg_by_game_state.csv"
 
-# Home team first: fixes row order in the report and the sign of the tracked scoreline.
+# Home team first: fixes the sign of the tracked scoreline and the CSV row order.
 HOME_TEAM = "Polonia Bytom"
+# The club this submission is written for; the printed table takes its perspective,
+# while the CSV keeps both teams.
+REPORT_TEAM = "Pogoń Grodzisk Mazowiecki"
 DECIMALS = 2
 
 # Columns describing the event itself, as opposed to its nested freeze-frame or lineup
@@ -33,6 +36,8 @@ EVENT_COLUMNS = [
 GAME_STATES = ["winning", "drawing", "losing"]
 MIRROR_STATE = {"winning": "losing", "drawing": "drawing", "losing": "winning"}
 STATE_LABELS_PL = {"winning": "prowadzenie", "drawing": "remis", "losing": "przegrywanie"}
+TIMELINE_LABELS_PL = {"winning": "Pogoń prowadzi", "drawing": "Pogoń remisuje",
+                      "losing": "Pogoń przegrywa"}
 
 
 def game_state(goals_for, goals_against):
@@ -45,7 +50,7 @@ def game_state(goals_for, goals_against):
 
 
 def load_events(path):
-    """Read the export, reduce it to one row per event, and report the reduction.
+    """Read the export and reduce it to one row per event.
 
     The file is in long format: StatsBomb's nested freeze_frame (shots) and lineup
     arrays are exploded into rows, so one Shot occupies one row per player in its
@@ -66,6 +71,19 @@ def load_events(path):
 
     assert len(events) == raw["id"].nunique()
     assert list(events["index"]) == list(range(1, len(events) + 1)), "Event index is not 1..N."
+
+    # Seconds since kick-off. `timestamp` restarts at 00:00:00 in the second half, so
+    # period-2 events are offset by the TRUE length of the first half (45:05 here)
+    # rather than by a nominal 45:00.
+    assert set(events["period"]) <= {1, 2}, (
+        "Extra time present: the offset below would place periods 3+ as if they were "
+        "the first half. This implementation is scoped to a two-period match."
+    )
+    parts = events["timestamp"].astype(str).str.split(":", expand=True)
+    within_period = parts[0].astype(int) * 3600 + parts[1].astype(int) * 60 + parts[2].astype(float)
+    first_half = within_period[(events["event_type_name"] == "Half End")
+                               & (events["period"] == 1)].iloc[0]
+    events["elapsed"] = within_period + (events["period"] == 2) * first_half
 
     shot_rows = raw[raw["event_type_name"] == "Shot"]
     unique_shots = events[events["event_type_name"] == "Shot"]
@@ -96,7 +114,6 @@ def prepare_shots(events):
 
     # The scoreline is walked through shots, so a goal recorded outside a Shot event
     # would desynchronise it for the rest of the match without breaking any xG total.
-    # The first check is independent of mechanism; the second names the known case.
     goals_from_shots = int(shots["is_goal"].sum())
     goals_conceded = int((events["type_name"] == "Goal Conceded").sum())
     assert goals_from_shots == goals_conceded, (
@@ -131,21 +148,12 @@ def score_intervals(events, shots, home_team):
     """The match split into intervals of constant scoreline, with clock bounds and length.
 
     A goal ends the interval it occurs in and starts the next one - the pre-shot rule
-    expressed on the time axis. Single source of truth for the timeline shown to the
-    reader and for the minutes-per-state figures, so the two cannot drift apart.
+    expressed on the time axis.
     """
+    goals = shots[shots["is_goal"]]
     half_ends = events[events["event_type_name"] == "Half End"]
-    marks = pd.concat([half_ends, shots[shots["is_goal"]]], ignore_index=True).sort_values("index")
+    final_whistle = half_ends.loc[half_ends["elapsed"].idxmax()]
 
-    parts = marks["timestamp"].astype(str).str.split(":", expand=True)
-    within_period = parts[0].astype(int) * 3600 + parts[1].astype(int) * 60 + parts[2].astype(float)
-    # `timestamp` restarts at 00:00:00 in the second half, so period-2 marks are offset by
-    # the true length of the first half rather than by a nominal 45:00.
-    first_half = within_period[(marks["event_type_name"] == "Half End") & (marks["period"] == 1)].iloc[0]
-    marks = marks.assign(elapsed=within_period + (marks["period"] == 2) * first_half)
-
-    goals = marks[marks["event_type_name"] == "Shot"]
-    final_whistle = marks.loc[marks["elapsed"].idxmax()]
     boundaries = (
         [(0.0, "0:00")]
         + [(goal.elapsed, f"{goal.minute}:{goal.second:02d}") for goal in goals.itertuples(index=False)]
@@ -253,43 +261,41 @@ def run_checks(shots, result, intervals, teams, decimals):
 
 
 def render_report(result, intervals, shots, teams, decimals):
-    """The Polish report: headline table, scoreline timeline, one summary line.
+    """Polish report: the table from REPORT_TEAM's perspective, then the score timeline."""
+    report_is_home = teams[0] == REPORT_TEAM
 
-    Identifiers and comments stay English; only reader-facing text is Polish, so that
-    the script's output matches the README character for character.
-    """
-    home_team, away_team = teams
     lines = [
-        f"Różnica xG według stanu meczu (stan sprzed strzału, {decimals} miejsca po przecinku)",
-        "| Drużyna | Stan meczu | xG drużyny | xG rywala | Różnica xG |",
-        "|---|---|---:|---:|---:|",
+        f"Różnica xG według stanu meczu (stan sprzed strzału, perspektywa: {REPORT_TEAM})",
+        "| Stan Pogoni | xG Pogoni | Strzały Pogoni | xG Polonii | Strzały Polonii | Różnica xG Pogoni |",
+        "|---|---:|---:|---:|---:|---:|",
     ]
-    for row in result.itertuples(index=False):
-        # Typographic minus, so the printed table matches the README exactly.
+    for state in GAME_STATES:
+        row = result[(result["team"] == REPORT_TEAM)
+                     & (result["game_state"] == state)].iloc[0]
         difference = f"{row.xg_difference:+.{decimals}f}".replace("-", "−")
         lines.append(
-            f"| {row.team} | {STATE_LABELS_PL[row.game_state]} | "
-            f"{row.xg_for:.{decimals}f} | {row.xg_against:.{decimals}f} | **{difference}** |"
+            f"| {STATE_LABELS_PL[state]} | {row.xg_for:.{decimals}f} | {row.shots_for} | "
+            f"{row.xg_against:.{decimals}f} | {row.shots_against} | **{difference}** |"
         )
 
     lines.append("\nPrzebieg wyniku")
     for interval in intervals.itertuples(index=False):
-        if interval.home_goals > interval.away_goals:
-            label = f"prowadzi {home_team}"
-        elif interval.home_goals < interval.away_goals:
-            label = f"prowadzi {away_team}"
-        else:
-            label = "remis"
-        # Whole minutes on purpose: the clock follows StatsBomb's convention (the second
-        # half restarts at 45:00) while durations are true elapsed time. Rounded to
-        # minutes, subtracting the printed clock gives the printed duration.
+        scored, conceded = (
+            (interval.home_goals, interval.away_goals) if report_is_home
+            else (interval.away_goals, interval.home_goals)
+        )
+        # Whole minutes: the clock follows StatsBomb's convention (the second half
+        # restarts at 45:00) while durations are true elapsed time; rounded to minutes
+        # the two agree.
         span = f"{interval.from_clock} – {interval.to_clock}"
-        lines.append(f"{span:>15}   {interval.score:^5}   {label:<36} {round(interval.minutes):>2} min")
+        lines.append(f"{span:>15}   {interval.score.replace('-', '–'):^5}   "
+                     f"{TIMELINE_LABELS_PL[game_state(scored, conceded)]:<16} "
+                     f"{round(interval.minutes):>2} min")
 
     final = intervals.iloc[-1]
-    drawing = result[result["game_state"] == "drawing"].iloc[0]
+    drawing = result[(result["team"] == REPORT_TEAM) & (result["game_state"] == "drawing")].iloc[0]
     lines += [
-        f"\nWynik końcowy: {home_team} {final['home_goals']} - {final['away_goals']} {away_team}",
+        f"\nWynik końcowy: {teams[0]} {final['home_goals']} - {final['away_goals']} {teams[1]}",
         f"Remis: {round(drawing.minutes)} z {round(intervals['minutes'].sum())} minut, "
         f"{drawing.shots_for + drawing.shots_against} z {len(shots)} strzałów.",
     ]
@@ -302,16 +308,19 @@ def main():
 
     teams = [HOME_TEAM] + sorted(set(events["team_name"].dropna()) - {HOME_TEAM})
     assert len(teams) == 2, f"Expected exactly two teams, found {teams}."
+    assert REPORT_TEAM in teams, f"{REPORT_TEAM} not in {teams}."
 
     intervals = score_intervals(events, shots, teams[0])
     result = build_result_table(intervals, shots, teams)
     run_checks(shots, result, intervals, teams, DECIMALS)
 
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    result.to_csv(OUTPUT_PATH, index=False)
+    # Force LF: pandas writes CRLF by default, which would make every run dirty the
+    # repository with a pure line-ending diff.
+    result.to_csv(OUTPUT_PATH, index=False, lineterminator="\n")
 
     print(render_report(result, intervals, shots, teams, DECIMALS))
-    print(f"\nPełna precyzja i liczby strzałów: {OUTPUT_PATH.relative_to(PROJECT_ROOT)}")
+    print(f"\nKomplet sześciu wierszy i minuty: {OUTPUT_PATH.relative_to(PROJECT_ROOT)}")
 
 
 if __name__ == "__main__":

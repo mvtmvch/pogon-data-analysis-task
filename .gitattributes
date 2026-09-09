@@ -1,0 +1,5 @@
+# Normalise line endings in the repository: the script and editors on Windows would
+# otherwise produce pure CRLF/LF diffs on every run.
+* text=auto eol=lf
+*.png binary
+*.csv text eol=lf
