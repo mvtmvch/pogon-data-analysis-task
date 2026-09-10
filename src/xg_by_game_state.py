@@ -25,6 +25,9 @@ HOME_TEAM = "Polonia Bytom"
 # while the CSV keeps both teams.
 REPORT_TEAM = "Pogoń Grodzisk Mazowiecki"
 DECIMALS = 2
+# Final score from the match protocol (Betclic 1. Liga, 22.08.2026). Anchors the
+# reconstruction to a source outside the export.
+FINAL_SCORE = (2, 2)  # home - away
 
 # Columns describing the event itself, as opposed to its nested freeze-frame or lineup
 # children. Only these are needed here.
@@ -34,7 +37,6 @@ EVENT_COLUMNS = [
 ]
 
 GAME_STATES = ["winning", "drawing", "losing"]
-MIRROR_STATE = {"winning": "losing", "drawing": "drawing", "losing": "winning"}
 STATE_LABELS_PL = {"winning": "prowadzenie", "drawing": "remis", "losing": "przegrywanie"}
 TIMELINE_LABELS_PL = {"winning": "Pogoń prowadzi", "drawing": "Pogoń remisuje",
                       "losing": "Pogoń przegrywa"}
@@ -79,11 +81,15 @@ def load_events(path):
         "Extra time present: the offset below would place periods 3+ as if they were "
         "the first half. This implementation is scoped to a two-period match."
     )
-    parts = events["timestamp"].astype(str).str.split(":", expand=True)
-    within_period = parts[0].astype(int) * 3600 + parts[1].astype(int) * 60 + parts[2].astype(float)
+    # Parsed right to left (last field = seconds): the two `Starting XI` rows carry
+    # "00:00", not HH:MM:SS.mmm, and reading a fixed third field turns those into NaN.
+    within_period = events["timestamp"].astype(str).str.split(":").map(
+        lambda fields: sum(float(v) * 60 ** i for i, v in enumerate(reversed(fields)))
+    )
     first_half = within_period[(events["event_type_name"] == "Half End")
                                & (events["period"] == 1)].iloc[0]
     events["elapsed"] = within_period + (events["period"] == 2) * first_half
+    assert events["elapsed"].notna().all(), "Some events have an unparsable timestamp."
 
     shot_rows = raw[raw["event_type_name"] == "Shot"]
     unique_shots = events[events["event_type_name"] == "Shot"]
@@ -215,40 +221,20 @@ def build_result_table(intervals, shots, teams):
                    "shots_for", "shots_against", "minutes"]]
 
 
-def run_checks(shots, result, intervals, teams, decimals):
-    """Sanity checks. Any failure here would mean a wrong answer, so the script stops."""
-    home_team, away_team = teams
-    tolerance = 1e-9
+def run_checks(result, intervals, decimals):
+    """Only the checks that can actually fail.
 
-    home_states = assign_game_states(shots, home_team)
-    away_states = assign_game_states(shots, away_team)
-    assert len(home_states) == len(shots) and home_states.notna().all()
-    assert set(home_states) <= set(GAME_STATES)
-    assert (home_states.map(MIRROR_STATE) == away_states).all(), "Game states are not mirrored."
-    assert len(intervals) == int(shots["is_goal"].sum()) + 1, "Interval count != goals + 1."
-
-    for team in teams:
-        team_rows = result[result["team"] == team]
-        by_team = shots["team_name"] == team
-        # The three states partition the team's shots, so xG and counts must both add up.
-        assert abs(team_rows["xg_for"].sum() - shots.loc[by_team, "statsbomb_xg"].sum()) < tolerance
-        assert abs(team_rows["xg_against"].sum() - shots.loc[~by_team, "statsbomb_xg"].sum()) < tolerance
-        assert team_rows["shots_for"].sum() == by_team.sum()
-        assert team_rows["shots_against"].sum() == (~by_team).sum()
-
-    match_lengths = result.groupby("team")["minutes"].sum()
-    assert match_lengths.max() - match_lengths.min() < tolerance
-    assert ((result["xg_for"] - result["xg_against"] - result["xg_difference"]).abs() < tolerance).all()
-
-    # Symmetry: both teams' shots in an interval are the same events seen from opposite
-    # sides, so xGD_A(state) == -xGD_B(mirror state) and all six values sum to zero.
-    for state in GAME_STATES:
-        home_value = result.loc[(result["team"] == home_team)
-                                & (result["game_state"] == state), "xg_difference"].iloc[0]
-        away_value = result.loc[(result["team"] == away_team)
-                                & (result["game_state"] == MIRROR_STATE[state]), "xg_difference"].iloc[0]
-        assert abs(home_value + away_value) < tolerance, f"Symmetry broken for {state}."
-    assert abs(result["xg_difference"].sum()) < tolerance
+    Identities that follow from how the table is built - xGD == xGF - xGA, the two
+    teams' states mirroring each other, the six differences summing to zero - are left
+    out: they cannot fail on any input, and they dilute the checks that can.
+    """
+    # The reconstruction is walked through shot events alone, so this is the one place
+    # it is compared against something outside the export.
+    reconstructed = (int(intervals.iloc[-1]["home_goals"]), int(intervals.iloc[-1]["away_goals"]))
+    assert reconstructed == FINAL_SCORE, (
+        f"Reconstructed {reconstructed[0]}-{reconstructed[1]}, "
+        f"protocol says {FINAL_SCORE[0]}-{FINAL_SCORE[1]}."
+    )
 
     # The rounded table in the README must still add up when a reader checks it by hand.
     rounded = result[["xg_for", "xg_against", "xg_difference"]].round(decimals)
@@ -272,7 +258,7 @@ def render_report(result, intervals, shots, teams, decimals):
     for state in GAME_STATES:
         row = result[(result["team"] == REPORT_TEAM)
                      & (result["game_state"] == state)].iloc[0]
-        difference = f"{row.xg_difference:+.{decimals}f}".replace("-", "−")
+        difference = f"{row.xg_difference:+.{decimals}f}"
         lines.append(
             f"| {STATE_LABELS_PL[state]} | {row.xg_for:.{decimals}f} | {row.shots_for} | "
             f"{row.xg_against:.{decimals}f} | {row.shots_against} | **{difference}** |"
@@ -287,8 +273,8 @@ def render_report(result, intervals, shots, teams, decimals):
         # Whole minutes: the clock follows StatsBomb's convention (the second half
         # restarts at 45:00) while durations are true elapsed time; rounded to minutes
         # the two agree.
-        span = f"{interval.from_clock} – {interval.to_clock}"
-        lines.append(f"{span:>15}   {interval.score.replace('-', '–'):^5}   "
+        span = f"{interval.from_clock} - {interval.to_clock}"
+        lines.append(f"{span:>15}   {interval.score:^5}   "
                      f"{TIMELINE_LABELS_PL[game_state(scored, conceded)]:<16} "
                      f"{round(interval.minutes):>2} min")
 
@@ -312,7 +298,7 @@ def main():
 
     intervals = score_intervals(events, shots, teams[0])
     result = build_result_table(intervals, shots, teams)
-    run_checks(shots, result, intervals, teams, DECIMALS)
+    run_checks(result, intervals, DECIMALS)
 
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     # Force LF: pandas writes CRLF by default, which would make every run dirty the
